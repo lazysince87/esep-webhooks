@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ESEP A8 GitHub Issues to Slack webhook in US East (Ohio)
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  IssueForwarder:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EsepWebhook
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt: [LambdaRole, Arn]
+      Timeout: 8
+      Code:
+        ZipFile: |
+          """Forward GitHub issue events for the assignment repository to Slack."""
+
+          import json
+          import os
+          import re
+          from urllib.error import HTTPError
+          from urllib.request import Request, urlopen
+
+
+          ISSUE_URL = re.compile(
+              r"https://github\.com/lazysince87/esep-webhooks/issues/[1-9][0-9]*"
+          )
+
+
+          def lambda_handler(event, _context):
+              """Receive the raw JSON body from the API Gateway REST integration."""
+              issue = event.get("issue") if isinstance(event, dict) else None
+              issue_url = issue.get("html_url") if isinstance(issue, dict) else None
+              if not isinstance(issue_url, str) or not ISSUE_URL.fullmatch(issue_url):
+                  return "ignored"
+
+              slack_url = os.environ.get("SLACK_URL", "").strip()
+              if not slack_url:
+                  raise RuntimeError("Set SLACK_URL in the Lambda environment variables.")
+
+              payload = json.dumps({"text": f"Issue Created: {issue_url}"}).encode("utf-8")
+              try:
+                  request = Request(
+                      slack_url,
+                      data=payload,
+                      headers={"Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  with urlopen(request, timeout=4) as response:
+                      if response.read(64).strip() != b"ok":
+                          raise RuntimeError("Slack did not acknowledge the message.")
+              except HTTPError as error:
+                  raise RuntimeError(f"Slack rejected the request (HTTP {error.code}).") from None
+              except (OSError, ValueError):
+                  raise RuntimeError("Could not reach the Slack webhook.") from None
+
+              return "ok"
+
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Esep-Webhook-Api
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: IssueForwarder
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub: arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/default/POST/
+
+  IssuePost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId:
+        Ref: WebhookApi
+      ResourceId:
+        Fn::GetAtt: [WebhookApi, RootResourceId]
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub: arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${IssueForwarder.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        IntegrationResponses:
+          - StatusCode: '200'
+          - StatusCode: '502'
+            SelectionPattern: '(?s).+'
+      MethodResponses:
+        - StatusCode: '200'
+        - StatusCode: '502'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [IssuePost, InvokePermission]
+    Properties:
+      RestApiId:
+        Ref: WebhookApi
+      StageName: default
+
+Outputs:
+  InvokeUrl:
+    Description: Use this URL as the GitHub webhook payload URL.
+    Value:
+      Fn::Sub: https://${WebhookApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/default
